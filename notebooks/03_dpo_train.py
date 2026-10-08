@@ -62,11 +62,71 @@ print(f"train={len(train_ds)} eval={len(eval_ds)}  columns={train_ds.column_name
 # ## 2. Huấn luyện
 
 # %%
+import gc
+import hashlib
+import time
+
 from trl import DPOTrainer
 
-args = MD.dpo_config(C.ADAPTERS / "dpo-checkpoints")
+
+def hash_module_chunked(module):
+    """Same TRL SHA-256, with small temporary CPU copies on Colab."""
+    h = hashlib.sha256()
+    for _, tensor in sorted(module.state_dict().items()):
+        h.update(str(tensor.dtype).encode())
+        flat = tensor.detach().reshape(-1)
+        for chunk in flat.split(1024 * 1024):
+            cpu = chunk.cpu()
+            if cpu.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+                cpu = cpu.to(torch.float32)
+            h.update(cpu.numpy().tobytes())
+    return h.hexdigest()
+
+
+hash_globals = DPOTrainer._precompute_ref_logps.__globals__
+original_hash_module = hash_globals["hash_module"]
+for dtype in (torch.float32, torch.float16, torch.bfloat16):
+    probe = torch.nn.Linear(7, 5, dtype=dtype)
+    assert hash_module_chunked(probe) == original_hash_module(probe)
+del probe
+hash_globals["hash_module"] = hash_module_chunked
+print("Chunked SHA-256 matches TRL for float32/float16/bfloat16")
+
+# Colab T4 run: effective batch remains 2 * 4 = 8.
+args = MD.dpo_config(
+    C.ADAPTERS / "dpo-checkpoints",
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    gradient_accumulation_steps=4,
+    precompute_ref_batch_size=4,
+    save_strategy="steps",
+    save_steps=25,
+    save_total_limit=1,
+)
 print(f"loss_type={args.loss_type} beta={args.beta} lr={args.learning_rate} "
       f"precompute_ref={args.precompute_ref_log_probs} max_length={args.max_length}")
+
+from transformers import AutoTokenizer
+
+original_tokenizer = AutoTokenizer.from_pretrained(C.BASE_MODEL)
+tokenizer_checks = ["Tiếng Việt có dấu: trí tuệ nhân tạo, hữu ích và an toàn."]
+for row in train_ds.select(range(10)):
+    for field in ("prompt", "chosen", "rejected"):
+        tokenizer_checks.append(row[field][0]["content"])
+for text in tokenizer_checks:
+    assert original_tokenizer(text, add_special_tokens=False)["input_ids"] == tokenizer(
+        text, add_special_tokens=False
+    )["input_ids"], "Saved tokenizer differs from base tokenizer"
+print(f"Tokenizer round-trip: {len(tokenizer_checks)} Vietnamese texts match")
+del original_tokenizer
+
+sys.last_traceback = None
+sys.last_value = None
+sys.last_exc = None
+gc.collect()
+torch.cuda.empty_cache()
+torch.cuda.reset_peak_memory_stats()
+dpo_started = time.perf_counter()
 
 trainer = DPOTrainer(
     model=model,
@@ -78,6 +138,9 @@ trainer = DPOTrainer(
 )
 result = trainer.train()
 final_eval = trainer.evaluate()
+dpo_elapsed_seconds = time.perf_counter() - dpo_started
+dpo_peak_vram_gb = torch.cuda.max_memory_allocated() / 1024**3
+print(f"DPO elapsed={dpo_elapsed_seconds:.1f}s peak allocated VRAM={dpo_peak_vram_gb:.3f} GiB")
 print(f"train loss {result.training_loss:.4f} · held-out reward accuracy "
       f"{final_eval.get('eval_rewards/accuracies', float('nan')):.3f}")
 
@@ -127,6 +190,18 @@ metrics = {
     "lr": C.DPO_LR,
     "loss_type": C.DPO_LOSS,
     "epochs": C.DPO_EPOCHS,
+    "seed": C.SEED,
+    "max_length": C.MAX_LEN,
+    "n_train": len(train_ds),
+    "n_eval": len(eval_ds),
+    "train_batch_size": args.per_device_train_batch_size,
+    "eval_batch_size": args.per_device_eval_batch_size,
+    "gradient_accumulation_steps": args.gradient_accumulation_steps,
+    "precompute_ref_batch_size": args.precompute_ref_batch_size,
+    "elapsed_seconds_including_reference_and_eval": dpo_elapsed_seconds,
+    "train_runtime_seconds": result.metrics.get("train_runtime"),
+    "peak_allocated_vram_gib": dpo_peak_vram_gb,
+    "tokenizer_roundtrip_texts": len(tokenizer_checks),
     "final_train_loss": float(result.training_loss),
     "first_logged_loss": first_loss,
     "end_chosen_reward": last(train_hist, "rewards/chosen"),
